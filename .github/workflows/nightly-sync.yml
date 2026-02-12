@@ -1,0 +1,103 @@
+name: Nightly Upstream Sync
+
+on:
+  schedule:
+    # Run every night at 02:00 UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    # Allow manual trigger
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          # Check if upstream remote exists, add if not
+          if ! git remote | grep -q "^upstream$"; then
+            git remote add upstream https://github.com/itsmylife44/cliproxyapi-dashboard.git
+          fi
+          git fetch upstream
+
+      - name: Check for upstream changes
+        id: check_changes
+        run: |
+          UPSTREAM_BRANCH="${{ vars.UPSTREAM_BRANCH || 'main' }}"
+          LOCAL_HEAD=$(git rev-parse HEAD)
+          UPSTREAM_HEAD=$(git rev-parse upstream/$UPSTREAM_BRANCH)
+          
+          if [ "$LOCAL_HEAD" = "$UPSTREAM_HEAD" ]; then
+            echo "No upstream changes detected"
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          else
+            echo "Upstream changes detected"
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "upstream_head=$UPSTREAM_HEAD" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create sync branch and merge
+        if: steps.check_changes.outputs.has_changes == 'true'
+        run: |
+          UPSTREAM_BRANCH="${{ vars.UPSTREAM_BRANCH || 'main' }}"
+          SYNC_BRANCH="sync/upstream-$(date +%Y%m%d-%H%M%S)"
+          
+          # Create and checkout sync branch
+          git checkout -b $SYNC_BRANCH
+          
+          # Merge upstream changes, prefer upstream on conflicts
+          git merge upstream/$UPSTREAM_BRANCH --no-edit -X theirs || {
+            echo "Merge conflicts detected, resolving by preferring upstream..."
+            # Accept all upstream changes for conflicted files
+            git checkout --theirs .
+            git add .
+            git commit -m "chore: merge upstream with conflict resolution (prefer upstream)"
+          }
+          
+          # Push sync branch
+          git push origin $SYNC_BRANCH
+          
+          echo "sync_branch=$SYNC_BRANCH" >> $GITHUB_OUTPUT
+
+      - name: Create Pull Request
+        if: steps.check_changes.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          UPSTREAM_BRANCH="${{ vars.UPSTREAM_BRANCH || 'main' }}"
+          SYNC_BRANCH="sync/upstream-$(date +%Y%m%d-%H%M%S)"
+          
+          # Get the sync branch we created
+          SYNC_BRANCH=$(git branch --show-current)
+          
+          gh pr create \
+            --title "chore: nightly upstream sync ($(date +%Y-%m-%d))" \
+            --body "Automated sync with upstream repository.
+
+            ## Changes
+            This PR merges the latest changes from upstream \`$UPSTREAM_BRANCH\` branch.
+
+            ## Merge Commit
+            Upstream commit: \`${{ steps.check_changes.outputs.upstream_head }}\`
+
+            ---
+            *This PR was automatically created by the nightly upstream sync workflow.*" \
+            --base main \
+            --head $SYNC_BRANCH \
+            --label "sync,automated"
+
+
