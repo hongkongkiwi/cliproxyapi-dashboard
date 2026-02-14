@@ -8,9 +8,11 @@ const CLIPROXYAPI_MANAGEMENT_URL =
 const MANAGEMENT_API_KEY = process.env.MANAGEMENT_API_KEY;
 
 interface AuthFile {
-  auth_index: string;
+  auth_index: string | number;
   provider: string;
-  email: string;
+  email?: string;
+  name?: string;
+  label?: string;
   disabled: boolean;
   status: string;
 }
@@ -355,6 +357,93 @@ async function fetchCodexQuota(
   }
 }
 
+async function fetchKimiQuota(
+  authIndex: string
+): Promise<QuotaGroup[] | { error: string }> {
+  try {
+    const response = await fetch(`${CLIPROXYAPI_MANAGEMENT_URL}/api-call`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${MANAGEMENT_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        auth_index: authIndex,
+        method: "POST",
+        url: "https://api.kimi.com/coding/v1/chat/completions",
+        header: {
+          Authorization: "Bearer $TOKEN$",
+          "Content-Type": "application/json",
+          "User-Agent": "KimiCLI/1.10.6",
+          "X-Msh-Platform": "kimi_cli",
+          "X-Msh-Version": "1.10.6",
+        },
+        data: JSON.stringify({
+          model: "kimi-k2",
+          max_tokens: 1,
+          messages: [{ role: "user", content: "1" }],
+        }),
+      }),
+    });
+
+    if (!response.ok) {
+      return { error: `API call failed: ${response.status}` };
+    }
+
+    const apiCallResult = (await response.json()) as ApiCallResponse;
+    const statusCode = Number(apiCallResult.status_code ?? apiCallResult.statusCode ?? 0);
+
+    if (statusCode < 200 || statusCode >= 300) {
+      return { error: `Provider API failed: ${statusCode}` };
+    }
+
+    // Kimi has no rate-limit headers or quota API — a successful response means the account is active
+    const body = parseApiCallBody(apiCallResult);
+    const usage = (body as Record<string, unknown>)?.usage as
+      | { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number }
+      | undefined;
+
+    const groups: QuotaGroup[] = [
+      {
+        id: "kimi-status",
+        label: "Account Status",
+        remainingFraction: 1,
+        resetTime: null,
+        models: [
+          {
+            id: "kimi-k2",
+            displayName: "Kimi K2",
+            remainingFraction: 1,
+            resetTime: null,
+          },
+          {
+            id: "kimi-k2-thinking",
+            displayName: "Kimi K2 Thinking",
+            remainingFraction: 1,
+            resetTime: null,
+          },
+          {
+            id: "kimi-k2.5",
+            displayName: "Kimi K2.5",
+            remainingFraction: 1,
+            resetTime: null,
+          },
+        ],
+      },
+    ];
+
+    if (usage?.total_tokens !== undefined) {
+      logger.info({ usage }, "Kimi account verified with usage data");
+    }
+
+    return groups;
+  } catch (error) {
+    return {
+      error: error instanceof Error ? error.message : "Unknown error",
+    };
+  }
+}
+
 function parseApiCallBody(result: ApiCallResponse): unknown {
   if (typeof result.body === "string") {
     try {
@@ -673,8 +762,18 @@ export async function GET() {
     );
 
     const quotaPromises = activeAccounts.map(async (account) => {
+      const authIndex = String(account.auth_index);
+      const displayEmail =
+        typeof account.email === "string" && account.email.trim() !== ""
+          ? account.email.trim()
+          : typeof account.label === "string" && account.label.trim() !== ""
+            ? account.label.trim()
+            : typeof account.name === "string" && account.name.trim() !== ""
+              ? account.name.trim()
+              : `${account.provider}-${authIndex}`;
+
       if (account.provider === "claude") {
-        const result = await fetchClaudeQuota(account.auth_index);
+        const result = await fetchClaudeQuota(authIndex);
 
         if ("error" in result) {
           const normalizedError = result.error.toLowerCase();
@@ -685,80 +784,102 @@ export async function GET() {
 
           if (needsReauth) {
             return {
-              auth_index: account.auth_index,
+              auth_index: authIndex,
               provider: account.provider,
-              email: account.email,
+              email: displayEmail,
               supported: true,
               error: "Claude OAuth token needs re-authentication (provider returned 401)",
             };
           }
 
           return {
-            auth_index: account.auth_index,
+            auth_index: authIndex,
             provider: account.provider,
-            email: account.email,
+            email: displayEmail,
             supported: true,
             error: result.error,
           };
         }
 
         return {
-          auth_index: account.auth_index,
+          auth_index: authIndex,
           provider: account.provider,
-          email: account.email,
+          email: displayEmail,
           supported: true,
           groups: result,
         };
       }
 
       if (account.provider === "antigravity") {
-        const result = await fetchAntigravityQuota(account.auth_index);
+        const result = await fetchAntigravityQuota(authIndex);
         
         if ("error" in result) {
           return {
-            auth_index: account.auth_index,
+            auth_index: authIndex,
             provider: account.provider,
-            email: account.email,
+            email: displayEmail,
             supported: true,
             error: result.error,
           };
         }
 
         return {
-          auth_index: account.auth_index,
+          auth_index: authIndex,
           provider: account.provider,
-          email: account.email,
+          email: displayEmail,
           supported: true,
           groups: result,
         };
       }
 
       if (account.provider === "codex") {
-        const result = await fetchCodexQuota(account.auth_index);
+        const result = await fetchCodexQuota(authIndex);
         
         if ("error" in result) {
           return {
-            auth_index: account.auth_index,
+            auth_index: authIndex,
             provider: account.provider,
-            email: account.email,
+            email: displayEmail,
             supported: true,
             error: result.error,
           };
         }
 
         return {
-          auth_index: account.auth_index,
+          auth_index: authIndex,
           provider: account.provider,
-          email: account.email,
+          email: displayEmail,
+          supported: true,
+          groups: result,
+        };
+      }
+
+      if (account.provider === "kimi") {
+        const result = await fetchKimiQuota(authIndex);
+
+        if ("error" in result) {
+          return {
+            auth_index: authIndex,
+            provider: account.provider,
+            email: displayEmail,
+            supported: true,
+            error: result.error,
+          };
+        }
+
+        return {
+          auth_index: authIndex,
+          provider: account.provider,
+          email: displayEmail,
           supported: true,
           groups: result,
         };
       }
 
       return {
-        auth_index: account.auth_index,
+        auth_index: authIndex,
         provider: account.provider,
-        email: account.email,
+        email: displayEmail,
         supported: false,
       };
     });
